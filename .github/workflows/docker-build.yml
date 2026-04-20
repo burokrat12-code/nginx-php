@@ -3,7 +3,7 @@ name: Build and Publish Docker Image
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # Позволяет запускать сборку вручную
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -33,21 +33,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest
             type=sha,format=long
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # Укажите платформу вашего устройства MikroTik. Например, linux/amd64 или linux/arm64
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
