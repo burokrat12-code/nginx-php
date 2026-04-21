@@ -16,7 +16,7 @@ RUN curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor \
 
 RUN apt-get update && apt-get install -y nginx=1.30.0-1~bookworm && apt-get clean
 
-# Обновление CA-сертификатов (для curl без -k)
+# Обновление CA-сертификатов
 RUN update-ca-certificates --fresh
 
 # Создание директорий
@@ -24,7 +24,7 @@ RUN mkdir -p /var/www/html /etc/ssl/certs /etc/ssl/private \
     && chown -R www-data:www-data /var/www/html \
     && mkdir -p /var/log/nginx /var/log/supervisor
 
-# Создание самоподписанного сертификата (запасной вариант)
+# Создание самоподписанного сертификата
 RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout /etc/ssl/private/nginx-selfsigned.key \
     -out /etc/ssl/certs/nginx-selfsigned.crt \
@@ -33,25 +33,22 @@ RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 # Настройка PHP-FPM на прослушивание порта 9000
 RUN sed -i 's|listen = /run/php/php8.2-fpm.sock|listen = 127.0.0.1:9000|' /etc/php/8.2/fpm/pool.d/www.conf
 
-# ========== НОВОЕ: Скрипт обновления Cloudflare IP ==========
+# Скрипт обновления Cloudflare IP
 COPY config/update-cloudflare-ips.sh /usr/local/bin/update-cloudflare-ips.sh
 RUN chmod +x /usr/local/bin/update-cloudflare-ips.sh
-
-# Создаём начальный файл с IP Cloudflare (чтобы nginx запустился)
 RUN /usr/local/bin/update-cloudflare-ips.sh
 
-# ========== НОВОЕ: Настройка cron ==========
+# Cron
 COPY config/crontab /etc/crontab
 RUN chmod 644 /etc/crontab && crontab /etc/crontab
 RUN touch /var/log/cloudflare-update.log && chmod 666 /var/log/cloudflare-update.log
 
-# ========== Копирование конфигов ==========
+# Копирование конфигов
 COPY config/nginx.conf /etc/nginx/nginx.conf
 COPY config/supervisord.conf /etc/supervisor/supervisord.conf
 COPY config/default-site.conf /etc/nginx/conf.d/default.conf
-COPY config/www.conf /etc/php/8.2/fpm/pool.d/www.conf
+COPY config/php-fpm.conf /etc/php/8.2/fpm/pool.d/www.conf   # ← ИСПРАВЛЕНО
 
-# Рабочая директория
 WORKDIR /var/www/html
 
 EXPOSE 80 443 8443
