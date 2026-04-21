@@ -29,7 +29,7 @@ RUN sed -i 's|listen = /run/php/php8.2-fpm.sock|listen = 127.0.0.1:9000|' /etc/p
 
 COPY config/update-cloudflare-ips.sh /usr/local/bin/update-cloudflare-ips.sh
 RUN chmod +x /usr/local/bin/update-cloudflare-ips.sh
-RUN /usr/local/bin/update-cloudflare-ips.sh
+RUN /usr/local/bin/update-cloudflare-ips.sh   # ← БЕЗ reload (Nginx не запущен)
 
 COPY config/crontab /etc/crontab
 RUN chmod 644 /etc/crontab && crontab /etc/crontab
