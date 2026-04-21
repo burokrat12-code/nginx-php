@@ -1,2 +1,2 @@
 # Обновление IP Cloudflare каждый день в 3:00
-0 3 * * * root /usr/local/bin/update-cloudflare-ips.sh > /var/log/cloudflare-update.log 2>&1
+0 3 * * * root /usr/local/bin/update-cloudflare-ips.sh reload > /var/log/cloudflare-update.log 2>&1
