@@ -3,7 +3,7 @@ FROM debian:bookworm-20241223-slim
 # Установка базовых пакетов + cron + ca-certificates + gettext (для envsubst)
 RUN apt-get update && apt-get install -y \
     curl gnupg2 ca-certificates lsb-release debian-archive-keyring \
-    supervisor php8.2-fpm php8.2-cli php8.2-common php8.2-opcache openssl \
+    supervisor php8.2-fpm php8.2-cli php8.2-common php8.2-opcache php8.2-curl \
     cron gettext \
     && apt-get clean
 
