@@ -52,28 +52,94 @@ events {
 http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
+    
+    # =============================
+    # RATE LIMITS
+    # =============================
+    limit_req_zone $binary_remote_addr zone=main_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=push_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=mail_limit:10m rate=3r/s;
+    limit_req_zone $binary_remote_addr zone=auth_limit:10m rate=2r/s;
+
+    limit_conn_zone $binary_remote_addr zone=main_conn:10m;
+    limit_conn_zone $binary_remote_addr zone=push_conn:10m;
+    limit_conn_zone $binary_remote_addr zone=mail_conn:10m;
+
+    limit_req_status 429;
+    limit_conn_status 429;
+    
+    # =============================
+    # MAPS
+    # =============================
+    map $http_user_agent $is_bad_ua {
+        default 0;
+        ~*(nmap|nikto|sqlmap|acunetix|nessus|masscan|zgrab|netsparker|qualys|whatweb) 1;
+        "~^Mozilla/5\.0$" 1;
+    }
+
+    map $uri $is_long_uri {
+        default 0;
+        "~^/.{120,}" 1;
+    }
+    
+    
+    # Разрешаем только GET, POST, HEAD (TRACE/CONNECT/PUT/DELETE/OPTIONS - 444)
+    map $request_method $is_allowed_method {
+        default 0;
+        GET     1;
+        POST    1;
+        HEAD    1;
+        OPTIONS 1;
+    }
+
     sendfile on;
     keepalive_timeout 65;
     server_tokens off;
 
+    # =============================
+    # GZIP СЖАТИЕ
+    # =============================
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_disable "msie6";
+    
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        text/x-js
+        text/js
+        application/json
+        application/javascript
+        application/x-javascript
+        application/xml
+        application/rss+xml
+        application/atom+xml
+        application/ld+json
+        application/manifest+json
+        image/svg+xml
+        font/ttf
+        font/otf
+        font/x-woff
+        font/woff
+        font/woff2
+        image/x-icon
+        image/vnd.microsoft.icon;
+
     # Глобальная настройка Real IP (Cloudflare + HAProxy)
     include /etc/nginx/cloudflare_real_ips.conf;
     set_real_ip_from 127.0.0.1;
-    set_real_ip_from ${HAPROXY_IP}; # IP контейнера HAProxy
-    
-    # ЗАКОММЕНТИРОВАНО ЗДЕСЬ, ЧТОБЫ ИЗБЕЖАТЬ DUPLICATE
-    # real_ip_header proxy_protocol; 
+    set_real_ip_from ${HAPROXY_IP};
+    set_real_ip_from ${VLESS_BACKEND};
     
     real_ip_recursive on;
 
     # Ограничение размера заголовков
     large_client_header_buffers 4 8k;
-    
-    # Блокировка длинных URI (защита от base64 payload'ов)
-    map $uri $is_long_uri {
-        default 0;
-        "~^/.{100,}" 1;
-    }    
 
     log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                     '$status $body_bytes_sent "$http_referer" '
@@ -86,44 +152,24 @@ http {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
 
-    # Разрешаем только GET, POST, HEAD
-    map $request_method $is_allowed_method {
-        default 0;
-        GET     1;
-        POST    1;
-        HEAD    1;
-    }
-
     # ========== ОСНОВНОЙ СЕРВЕР ==========
     server {
         listen 8443 ssl proxy_protocol;
         server_name ${MAIN_DOMAIN};
 
-        # Проверка метода запроса
-        if ($is_allowed_method = 0) {
-            return 444;
-        }
+        limit_req zone=main_limit burst=20 nodelay;
+        limit_conn main_conn 20;
 
-        # Блокировка длинных URI
-        if ($is_long_uri) {
-            return 444;
-        }        
-
-        # РАСКОММЕНТИРОВАНО ДЛЯ КОНКРЕТНОГО SERVER (не конфликтует с глобальными)
         set_real_ip_from 127.0.0.1;
         set_real_ip_from ${HAPROXY_IP};
+        set_real_ip_from ${VLESS_BACKEND};
         real_ip_header proxy_protocol;
-
-        # Блокировка по рефереру с IP сервера (защита от прямых запросов)
-        if ($http_referer ~* (${IP_SERV_ESCAPED})) {
-            return 444;
-        }        
 
         ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
         ssl_certificate_key /etc/ssl/certs/${MAIN_DOMAIN}.key;
 
         ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
         ssl_prefer_server_ciphers on;
         ssl_session_cache shared:SSL:10m;
         ssl_session_timeout 10m;
@@ -134,17 +180,81 @@ http {
         error_page 403 /403.html;
         error_page 404 /404.html;
 
+        if ($is_allowed_method = 0) { return 444; }
+        if ($is_long_uri) { return 444; }
+        if ($is_bad_ua) { return 444; }
+
+        # РАЗРЕШАЕМ ИКОНКИ
+        location ~* ^/favicon.*\.(png|ico|jpg|jpeg|svg)$ {
+            access_log off;
+            log_not_found off;
+            allow all;
+            expires 30d;
+        }
+
         # ЗАЩИТА И БЕЗОПАСНОСТЬ
         location ~ /\. { deny all; return 444; }
         location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 444; }
         location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 444; }
         location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|json|xml|sh|py|pl|rb)$ { deny all; return 403; }
-        if ($http_user_agent ~* (nmap|nikto|wikto|sf|sqlmap|bsqlbf|w3af|acunetix|havij|appscan|whatweb|zgrab|curl|python|go-http|masscan|netsparker|nessus|qualys|visionheight|Go-http-client|Java|libwww-perl|LWP::Simple|PHPCurl|Wget)) { 
-            return 444; 
+
+        location / {
+            try_files $uri $uri/ =404;
         }
 
-        # Отсекаем подозрительно короткие/стандартные UA
-        if ($http_user_agent ~ "^Mozilla/5\.0$") {
+                # ========== PHP ОБРАБОТКА ==========
+        
+        # Разрешённые PHP endpoints (точные совпадения)
+        location = /login.php {
+            limit_except POST {
+                deny all;
+            }
+
+            limit_req zone=auth_limit burst=5 nodelay;
+            include fastcgi_params;
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param REMOTE_ADDR $remote_addr;
+            fastcgi_param HTTP_X_REAL_IP $remote_addr;
+            fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
+            fastcgi_param HTTP_CF_CONNECTING_IP $http_cf_connecting_ip;
+        }
+
+        location = /get-ip.php {
+            include fastcgi_params;
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param REMOTE_ADDR $remote_addr;
+            fastcgi_param HTTP_X_REAL_IP $remote_addr;
+            fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
+            fastcgi_param HTTP_CF_CONNECTING_IP $http_cf_connecting_ip;
+        }
+
+        #location = /weather.php {
+        #    include fastcgi_params;
+        #   fastcgi_pass 127.0.0.1:9000;
+        #    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        #    fastcgi_param REMOTE_ADDR $remote_addr;
+        #    fastcgi_param HTTP_X_REAL_IP $remote_addr;
+        #    fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
+        #    fastcgi_param HTTP_CF_CONNECTING_IP $http_cf_connecting_ip;
+        #}
+
+        # ЧПУ (pretty URLs) → редирект на PHP
+        location = /login {
+            rewrite ^ /login.php last;
+        }
+
+        location = /get-ip {
+            rewrite ^ /get-ip.php last;
+        }
+
+        #location = /weather {
+        #    rewrite ^ /weather.php last;
+        #}
+
+        # Запрет всех остальных .php файлов
+        location ~ \.php$ {
             return 444;
         }
 
@@ -157,75 +267,45 @@ http {
         location = /bg-poster_403.jpeg { root /var/www/html/403; default_type image/jpeg; }
         location /403/ { root /var/www/html; }
         location /404/ { root /var/www/html; }
-
-        location / {
-            try_files $uri $uri/ =404;
-        }
-
-        location ~ \.php$ {
-            set $allowed 0;
-            if ($uri ~* "^/(index|login|auth|api|logins_history|get-ip)\.php$") {
-                set $allowed 1;
-            }
-            if ($allowed = 0) {
-                return 444;
-            }
-            
-            fastcgi_pass 127.0.0.1:9000;
-            fastcgi_index index.php;
-            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            fastcgi_param REMOTE_ADDR $remote_addr;
-            fastcgi_param HTTP_X_REAL_IP $remote_addr;
-            fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
-            fastcgi_param HTTP_CF_CONNECTING_IP $http_cf_connecting_ip;
-            include fastcgi_params;
-        }
     }
 
-    # ========== PUSH СЕРВЕР ==========
+        # ========== PUSH СЕРВЕР (РАБОЧАЯ ВЕРСИЯ — БЕЗ LIMIT_EXCEPT) ==========
     server {
         listen 8443 ssl proxy_protocol;
         server_name ${PUSH_DOMAIN};
 
-        if ($is_allowed_method = 0) {
-            return 444;
-        }
-
-        # Блокировка длинных URI
-        if ($is_long_uri) {
-            return 444;
-        }
+        limit_req zone=push_limit burst=20 nodelay;
+        limit_conn push_conn 50;
 
         set_real_ip_from 127.0.0.1;
         set_real_ip_from ${HAPROXY_IP};
+        set_real_ip_from ${VLESS_BACKEND};
         real_ip_header proxy_protocol;
-
-        if ($http_referer ~* (${IP_SERV_ESCAPED})) {
-            return 444;
-        }
 
         ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
         ssl_certificate_key /etc/ssl/certs/${MAIN_DOMAIN}.key;
 
         ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
         ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
 
         error_page 403 /403.html;
         error_page 404 /404.html;
 
-        location ~ /\. { deny all; return 444; }
-        location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 444; }
-        location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 444; }
-        location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|json|xml|sh|py|pl|rb)$ { deny all; return 403; }
-        if ($http_user_agent ~* (nmap|nikto|wikto|sf|sqlmap|bsqlbf|w3af|acunetix|havij|appscan|whatweb|zgrab|curl|python|go-http|masscan|netsparker|nessus|qualys|visionheight|Go-http-client|Java|libwww-perl|LWP::Simple|PHPCurl|Wget)) { 
-            return 444; 
-        }
+        # ГЛОБАЛЬНЫЕ ПРОВЕРКИ
+        if ($is_allowed_method = 0) { return 444; }
+        if ($is_bad_ua) { return 444; }
+        if ($is_long_uri) { return 444; }
 
-        if ($http_user_agent ~ "^Mozilla/5\.0$") {
-            return 444;
-        }
+        # ЗАЩИТА ОТ ОПАСНЫХ ПУТЕЙ
+        location ~ /\. { deny all; return 404; }
+        location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 404; }
+        location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 404; }
+        location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|json|xml|sh|py|pl|rb)$ { deny all; return 404; }
 
+        # СТРАНИЦЫ ОШИБОК
         location = /403.html { root /var/www/html/403; internal; }
         location = /404.html { root /var/www/html/404; internal; }
         location = /bg-video.mp4 { root /var/www/html/404; default_type video/mp4; add_header Accept-Ranges bytes; }
@@ -235,10 +315,15 @@ http {
         location /403/ { root /var/www/html; }
         location /404/ { root /var/www/html; }
 
+        # ЗАГОЛОВКИ БЕЗОПАСНОСТИ
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
         add_header Content-Security-Policy "upgrade-insecure-requests";
         add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
 
+        # ALERT ENDPOINT
         location ~ ^/alert[a-zA-Z0-9_\-]*(/.*)?$ {
             if ($http_user_agent !~* "(?i)(ntfy|${NTFY_UserAgent})") {
                 return 404;
@@ -256,10 +341,11 @@ http {
             proxy_read_timeout 86400;
         }
 
-        location = ${NTFY_SECRET_PATH}/ {
-            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Lax" always;
+        # СЕКРЕТНЫЙ ПУТЬ
+        location ~ ^${NTFY_SECRET_PATH}/?$ {
+            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=3600" always;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
-            proxy_pass http://${NTFY_BACKEND}:80/;
+            proxy_pass http://${NTFY_BACKEND}:80;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -272,14 +358,54 @@ http {
             proxy_read_timeout 86400;
         }
 
-        location = /config.js { proxy_pass http://${NTFY_BACKEND}:80/config.js; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; }
-        location = /manifest.webmanifest { proxy_pass http://${NTFY_BACKEND}:80/manifest.webmanifest; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; }
-        location = /sw.js { proxy_pass http://${NTFY_BACKEND}:80/sw.js; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; }
-        location /static/ { proxy_pass http://${NTFY_BACKEND}:80/static/; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; }
+        # СТАТИЧЕСКИЕ ФАЙЛЫ NTFY
+        location = /config.js { 
+            if ($http_cookie !~* "access=granted") { return 404; }
+            proxy_pass http://${NTFY_BACKEND}:80/config.js; 
+            proxy_set_header Host $host; 
+            proxy_set_header X-Real-IP $remote_addr; 
+        }
+        
+        location = /manifest.webmanifest { 
+            if ($http_cookie !~* "access=granted") { return 404; }
+            proxy_pass http://${NTFY_BACKEND}:80/manifest.webmanifest; 
+            proxy_set_header Host $host; 
+            proxy_set_header X-Real-IP $remote_addr; 
+        }
+        
+        location = /sw.js { 
+            if ($http_cookie !~* "access=granted") { return 404; }
+            proxy_pass http://${NTFY_BACKEND}:80/sw.js; 
+            proxy_set_header Host $host; 
+            proxy_set_header X-Real-IP $remote_addr; 
+        }
+        
+        location /static/ { 
+            if ($http_cookie !~* "access=granted") { return 404; }
+            proxy_pass http://${NTFY_BACKEND}:80/static/; 
+            proxy_set_header Host $host; 
+            proxy_set_header X-Real-IP $remote_addr; 
+        }
 
+        # ОСНОВНОЙ ЛОКЕЙШН (КОРЕНЬ)
         location / {
-            root /var/www/html/404;
-            try_files $uri $uri/ =404;
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            
+            if ($http_cookie !~* "access=granted") { 
+                return 404;
+            }
+            proxy_pass http://${NTFY_BACKEND}:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_buffering off;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
         }
     }
 
@@ -288,45 +414,36 @@ http {
         listen 8443 ssl proxy_protocol;
         server_name ${MAIL_DOMAIN};
 
-        if ($is_allowed_method = 0) {
-            return 444;
-        }
+        limit_req zone=mail_limit burst=5 nodelay;
+        limit_conn mail_conn 10;
 
-        # Блокировка длинных URI
-        if ($is_long_uri) {
-            return 444;
-        }
-        
         set_real_ip_from 127.0.0.1;
         set_real_ip_from ${HAPROXY_IP};
+        set_real_ip_from ${VLESS_BACKEND};
         real_ip_header proxy_protocol;
-
-        if ($http_referer ~* (${IP_SERV_ESCAPED})) {
-            return 444;
-        }
 
         ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
         ssl_certificate_key /etc/ssl/certs/${MAIN_DOMAIN}.key;
-
         ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
         ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
 
         error_page 403 /403.html;
         error_page 404 /404.html;
 
+        if ($is_allowed_method = 0) { return 444; }
+        if ($is_bad_ua) { return 444; }
+        if ($is_long_uri) { return 444; }
+
+        # ЗАЩИТА ОТ ОПАСНЫХ ПУТЕЙ
         location ~ /\. { deny all; return 444; }
         location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 444; }
         location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 444; }
         location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|json|xml|sh|py|pl|rb)$ { deny all; return 403; }
-        if ($http_user_agent ~* (nmap|nikto|wikto|sf|sqlmap|bsqlbf|w3af|acunetix|havij|appscan|whatweb|zgrab|curl|python|go-http|masscan|netsparker|nessus|qualys|visionheight|Go-http-client|Java|libwww-perl|LWP::Simple|PHPCurl|Wget)) { 
-            return 444; 
-        }
 
-        if ($http_user_agent ~ "^Mozilla/5\.0$") {
-            return 444;
-        }
-
+        # СТРАНИЦЫ ОШИБОК
         location = /403.html { root /var/www/html/403; internal; }
         location = /404.html { root /var/www/html/404; internal; }
         location = /bg-video.mp4 { root /var/www/html/404; default_type video/mp4; add_header Accept-Ranges bytes; }
@@ -336,17 +453,23 @@ http {
         location /403/ { root /var/www/html; }
         location /404/ { root /var/www/html; }
 
+        # ЗАГОЛОВКИ БЕЗОПАСНОСТИ
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
         add_header Content-Security-Policy "upgrade-insecure-requests";
         add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
 
-        location = ${MAIL_SECRET_PATH}/ {
-            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Lax" always;
+        # СЕКРЕТНЫЙ ПУТЬ (исправлено: работает со слэшем и без)
+        location ~ ^${MAIL_SECRET_PATH}/?$ {   # исправлено
+            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=3600" always;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
             return 302 https://$host/login;
         }
 
-        location ~ ^/(static|assets|api|auth|login|manage) {
+        # API И СТАТИЧЕСКИЕ РЕСУРСЫ
+        location ~ ^/(static|assets|api|auth|manage) {
             if ($http_cookie !~* "access=granted") { 
                 return 404; 
             }
@@ -363,7 +486,26 @@ http {
             proxy_ssl_verify off;
         }
 
+        location = /login {
+            proxy_pass https://${MAIL_BACKEND}:443/login;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_buffering off;
+            proxy_ssl_verify off;
+        }
+
+        # КОРЕНЬ (требует cookie)
         location / {
+            # Добавлены заголовки безопасности (исправлено: наследование add_header)
+            add_header X-Frame-Options "SAMEORIGIN" always;           # исправлено
+            add_header X-Content-Type-Options "nosniff" always;      # исправлено
+            add_header X-XSS-Protection "1; mode=block" always;      # исправлено
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;  # исправлено
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;              # исправлено
+            
             if ($http_cookie !~* "access=granted") { 
                 return 404; 
             }
@@ -393,7 +535,7 @@ http {
         }
 
         location / {
-            return 301 https://$server_name$request_uri;
+            return 301 https://$host$request_uri;   # исправлено: $server_name → $host
         }
     }
 }
