@@ -43,18 +43,23 @@ RUN sed -i 's|listen = /run/php/php8.2-fpm.sock|listen = 127.0.0.1:9000|' /etc/p
 COPY config/update-cloudflare-ips.sh /usr/local/bin/update-cloudflare-ips.sh
 RUN chmod +x /usr/local/bin/update-cloudflare-ips.sh
 
-# Создаём начальный файл с IP Cloudflare
+# Создаём начальные файлы с IP Cloudflare (сразу при сборке)
+# Этот скрипт создаёт:
+#   - /etc/nginx/cloudflare_real_ips.conf (для nginx)
+#   - /tmp/cloudflare_ips.txt (для analyze_logs.sh)
 RUN /usr/local/bin/update-cloudflare-ips.sh
 
 # ========== СКРИПТ АНАЛИЗА ЛОГОВ И БАНА ==========
 COPY scripts/analyze_logs.sh /usr/local/bin/analyze_logs.sh
-RUN chmod +x /usr/local/bin/analyze_logs.sh && \
-    touch /tmp/nginx_ban_last_run && chmod 666 /tmp/nginx_ban_last_run
+RUN chmod +x /usr/local/bin/analyze_logs.sh
+
+# Создаём файлы состояния для инкрементального анализа
+RUN touch /tmp/nginx_ban_last_run && chmod 666 /tmp/nginx_ban_last_run
 
 # ========== НАСТРОЙКА LOGROTATE ДЛЯ NGINX ==========
 COPY config/logrotate-nginx.conf /etc/logrotate.d/nginx
 
-# ========== CRON ==========
+# ========== CRON ДЛЯ CLOUDFLARE (ежедневное обновление) ==========
 COPY config/crontab /etc/cron.d/cloudflare-update
 RUN chmod 644 /etc/cron.d/cloudflare-update
 RUN touch /var/log/cloudflare-update.log && chmod 666 /var/log/cloudflare-update.log
