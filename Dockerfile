@@ -33,13 +33,16 @@ RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 # 6. Настройка PHP-FPM на прослушивание порта 9000
 RUN sed -i 's|listen = /run/php/php8.2-fpm.sock|listen = 127.0.0.1:9000|' /etc/php/8.2/fpm/pool.d/www.conf
 
-# ========== СКРИПТЫ ОБНОВЛЕНИЯ IP (Cloudflare, Google, DDNS) ==========
-COPY config/update-cloudflare-ips.sh /usr/local/bin/update-cloudflare-ips.sh
-COPY config/update_my_ips.sh /usr/local/bin/update_my_ips.sh
-COPY config/update_google_ips.sh /usr/local/bin/update_google_ips.sh
+# ========== СКРИПТЫ ОБНОВЛЕНИЯ IP И АНАЛИЗА ==========
+COPY scripts/update-cloudflare-ips.sh /usr/local/bin/update-cloudflare-ips.sh
+COPY scripts/update_my_ips.sh /usr/local/bin/update_my_ips.sh
+COPY scripts/update_google_ips.sh /usr/local/bin/update_google_ips.sh
+COPY scripts/analyze_logs.sh /usr/local/bin/analyze_logs.sh
+
 RUN chmod +x /usr/local/bin/update-cloudflare-ips.sh \
              /usr/local/bin/update_my_ips.sh \
-             /usr/local/bin/update_google_ips.sh
+             /usr/local/bin/update_google_ips.sh \
+             /usr/local/bin/analyze_logs.sh
 
 # ========== СКРИПТ АНАЛИЗА ЛОГОВ И БАНА ==========
 COPY scripts/analyze_logs.sh /usr/local/bin/analyze_logs.sh
