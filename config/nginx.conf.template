@@ -89,8 +89,23 @@ http {
         GET     1;
         POST    1;
         HEAD    1;
-        OPTIONS 1;
+    
     }
+
+    #map "$request_method:$host" $is_allowed_method {
+    #    default 0;
+
+    #    # 1. Базовые методы разрешены ДЛЯ ВСЕХ сайтов
+    #    ~^GET: 1;
+    #    ~^POST: 1;
+    #    ~^HEAD: 1;
+
+    #    # 2. REST API методы (PUT/DELETE/PATCH/OPTIONS) разрешены ТОЛЬКО для Home Assistant
+    #    OPTIONS:homeassru.cargo-port.eu 1;
+    #    PUT:homeassru.cargo-port.eu     1;
+    #    DELETE:homeassru.cargo-port.eu  1;
+    #    PATCH:homeassru.cargo-port.eu   1;
+    #}
 
     sendfile on;
     keepalive_timeout 65;
@@ -138,6 +153,17 @@ http {
     
     real_ip_recursive on;
 
+    # Проверка IP-адреса Google Assistant (благодаря real_ip $remote_addr уже содержит IP конечного клиента)
+    geo $remote_addr $is_google {
+        default 0;
+        include /etc/nginx/google_ips.conf;
+    }
+
+    geo $remote_addr $is_my_ip {
+        default 0;
+        include /etc/nginx/my_custom_ips.conf;
+    }
+
     # Ограничение размера заголовков
     large_client_header_buffers 4 8k;
 
@@ -153,6 +179,32 @@ http {
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header Content-Security-Policy "upgrade-insecure-requests";
+
+    # ========== CADDY ==========
+    server {
+        listen 8444 ssl;
+
+        server_name caddy.cargo-port.eu;
+        set_real_ip_from 192.168.254.42;  # IP Caddy
+        real_ip_header X-Forwarded-For;
+        real_ip_recursive on;
+
+        ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
+        ssl_certificate_key /etc/ssl/certs/${MAIN_DOMAIN}.key;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        root ${WEB_ROOT};
+        index index.html;
+
+        # без proxy_protocol !!!
+        # без real_ip_header proxy_protocol !!!
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+
 
     # ========== ОСНОВНОЙ СЕРВЕР ==========
     server {
@@ -257,7 +309,7 @@ http {
         location /404/ { root /var/www/html; }
     }
 
-        # ========== PUSH СЕРВЕР (РАБОЧАЯ ВЕРСИЯ — БЕЗ LIMIT_EXCEPT) ==========
+    # ========== PUSH СЕРВЕР (ФИЛЬТРАЦИЯ ПО IP + USER-AGENT) ==========
     server {
         listen 8443 ssl proxy_protocol;
         server_name ${PUSH_DOMAIN};
@@ -267,7 +319,7 @@ http {
         set_real_ip_from ${VLESS_BACKEND};
         real_ip_header proxy_protocol;
 
-        limit_req zone=push_limit burst=20 nodelay;
+        limit_req zone=push_limit burst=50 nodelay;
         limit_conn push_conn 50;
 
         ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
@@ -291,7 +343,7 @@ http {
         location ~ /\. { deny all; return 404; }
         location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 404; }
         location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 404; }
-        location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|json|xml|sh|py|pl|rb)$ { deny all; return 404; }
+        location ~* \.(txt|log|ini|conf|bak|backup|old|sql|zip|tar|gz|sqlite|db|yml|yaml|sh|py|pl|rb)$ { deny all; return 404; }
 
         # СТРАНИЦЫ ОШИБОК
         location = /403.html { root /var/www/html/403; internal; }
@@ -311,93 +363,58 @@ http {
         add_header Content-Security-Policy "upgrade-insecure-requests";
         add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
 
-        # ALERT ENDPOINT
-        location ~ ^/alert[a-zA-Z0-9_\-]*(/.*)?$ {
-            if ($http_user_agent !~* "(?i)(ntfy|${NTFY_UserAgent})") {
-                return 404;
-            }
-            proxy_pass http://${NTFY_BACKEND}:80;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-            proxy_buffering off;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_read_timeout 86400;
-        }
-
-        # СЕКРЕТНЫЙ ПУТЬ
-        location ~ ^${NTFY_SECRET_PATH}/?$ {
-            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=3600" always;
-            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
-            proxy_pass http://${NTFY_BACKEND}:80;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-            proxy_buffering off;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_read_timeout 86400;
-        }
-
-        # СТАТИЧЕСКИЕ ФАЙЛЫ NTFY
-        location = /config.js { 
-            if ($http_cookie !~* "access=granted") { return 404; }
-            proxy_pass http://${NTFY_BACKEND}:80/config.js; 
-            proxy_set_header Host $host; 
-            proxy_set_header X-Real-IP $remote_addr; 
-        }
-        
-        location = /manifest.webmanifest { 
-            if ($http_cookie !~* "access=granted") { return 404; }
-            proxy_pass http://${NTFY_BACKEND}:80/manifest.webmanifest; 
-            proxy_set_header Host $host; 
-            proxy_set_header X-Real-IP $remote_addr; 
-        }
-        
-        location = /sw.js { 
-            if ($http_cookie !~* "access=granted") { return 404; }
-            proxy_pass http://${NTFY_BACKEND}:80/sw.js; 
-            proxy_set_header Host $host; 
-            proxy_set_header X-Real-IP $remote_addr; 
-        }
-        
-        location /static/ { 
-            if ($http_cookie !~* "access=granted") { return 404; }
-            proxy_pass http://${NTFY_BACKEND}:80/static/; 
-            proxy_set_header Host $host; 
-            proxy_set_header X-Real-IP $remote_addr; 
-        }
-
-        # ОСНОВНОЙ ЛОКЕЙШН (КОРЕНЬ)
+        # ОСНОВНОЙ ЛОКЕЙШН
         location / {
-            add_header X-Frame-Options "SAMEORIGIN" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-XSS-Protection "1; mode=block" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
-            
-            if ($http_cookie !~* "access=granted") { 
-                return 404;
+            # Разрешаем доступ если совпал $is_my_ip ИЛИ User-Agent
+            set $access_allowed 0;
+
+            if ($is_my_ip = 1) {
+                set $access_allowed 1;
             }
+
+            if ($http_user_agent ~* "${NTFY_UserAgent}") {
+                set $access_allowed 1;
+            }
+
+            # 2. Проверяем СЕКРЕТНЫЙ ЗАГОЛОВОК (для приложения и MikroTik)
+            # Nginx автоматически переводит заголовок X-Secret-Token в переменную $http_x_secret_token
+            if ($http_x_secret_token = $X_TOKEN) {
+                set $access_allowed 1;
+            }
+
+            if ($access_allowed = 0) {
+                return 444;
+            }
+
+            # Проксирование на ntfy
             proxy_pass http://${NTFY_BACKEND}:80;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+
+            # Отключение буферизации для SSE / JSON Stream
             proxy_buffering off;
+            proxy_cache off;
+            chunked_transfer_encoding off;
+
+            # Динамический Upgrade / Connection для WebSocket
             proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
+            set $conn_directive "upgrade";
+            if ($http_upgrade = "") {
+                set $conn_directive "";
+            }
+            proxy_set_header Connection $conn_directive;
+
+            # Таймауты для удерживания сокетов
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
         }
     }
 
-    # ========== MAIL СЕРВЕР ==========
+    # ========== MAIL СЕРВЕР (RESTRICTED TO MY IPs ONLY) ==========
     server {
         listen 8443 ssl proxy_protocol;
         server_name ${MAIL_DOMAIN};
@@ -421,11 +438,17 @@ http {
         error_page 403 /403.html;
         error_page 404 /404.html;
 
+        # 🛑 1. ЖЕСТКАЯ ПРОВЕРКА IP: Доступ разрешен ТОЛЬКО с твоих IP
+        if ($is_my_ip = 0) {
+            return 444;
+        }
+
+        # Базовые проверки на ботов и мусор
         if ($is_allowed_method = 0) { return 444; }
         if ($is_bad_ua) { return 444; }
         if ($is_long_uri) { return 444; }
 
-        # ЗАЩИТА ОТ ОПАСНЫХ ПУТЕЙ
+        # ЗАЩИТА ОТ ОПАСНЫХ ПУТЕЙ И СКРИПТОВ
         location ~ /\. { deny all; return 444; }
         location ~* (wp-admin|wp-login|xmlrpc|wp-config|setup-config|\.env|\.git|\.svn|\.htaccess|\.htpasswd|phpmyadmin|adminer|webdav|autodiscover|geoserver) { return 444; }
         location ~* /(info|test|phpinfo|debug|dev|config|setup|install|probe|check|status)\.php$ { deny all; return 444; }
@@ -449,54 +472,14 @@ http {
         add_header Content-Security-Policy "upgrade-insecure-requests";
         add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
 
-        # СЕКРЕТНЫЙ ПУТЬ (исправлено: работает со слэшем и без)
-        location ~ ^${MAIL_SECRET_PATH}/?$ {   # исправлено
-            add_header Set-Cookie "access=granted; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=3600" always;
-            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
-            return 302 https://$host/login;
-        }
-
-        # API И СТАТИЧЕСКИЕ РЕСУРСЫ
-        location ~ ^/(static|assets|api|auth|manage) {
-            if ($http_cookie !~* "access=granted") { 
-                return 404; 
-            }
-            proxy_pass https://${MAIL_BACKEND}:443;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_buffering off;
-            proxy_ssl_verify off;
-        }
-
-        location = /login {
-            proxy_pass https://${MAIL_BACKEND}:443/login;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_buffering off;
-            proxy_ssl_verify off;
-        }
-
-        # КОРЕНЬ (требует cookie)
+        # 🟢 2. ПОЛНЫЙ ДОСТУП К ВЕБ-ПОЧТЕ (Проксирование всех запросов)
         location / {
-            # Добавлены заголовки безопасности (исправлено: наследование add_header)
-            add_header X-Frame-Options "SAMEORIGIN" always;           # исправлено
-            add_header X-Content-Type-Options "nosniff" always;      # исправлено
-            add_header X-XSS-Protection "1; mode=block" always;      # исправлено
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;  # исправлено
-            add_header Cache-Control "no-store, no-cache, must-revalidate" always;              # исправлено
-            
-            if ($http_cookie !~* "access=granted") { 
-                return 404; 
-            }
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+
             proxy_pass https://${MAIL_BACKEND}:443;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -504,17 +487,104 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
+
             proxy_buffering off;
             proxy_ssl_verify off;
+            proxy_read_timeout 86400;
+            proxy_send_timeout 86400;
+        }
+    }
+
+    # ========== HOME ASSISTANT (RESTRICTED: GOOGLE INTEGRATION + MY FULL ACCESS) ==========
+    server {
+        listen 8443 ssl proxy_protocol;
+        server_name ${HA_DOMAIN};
+
+        #access_log /var/log/nginx/homeass_access.log;
+        #error_log  /var/log/nginx/homeass_error.log warn;
+
+        set_real_ip_from 127.0.0.1;
+        set_real_ip_from ${HAPROXY_IP};
+        set_real_ip_from ${VLESS_BACKEND};
+        real_ip_header proxy_protocol;
+
+        limit_req zone=main_limit burst=80 nodelay;
+        limit_conn main_conn 50;
+
+        ssl_certificate /etc/ssl/certs/${MAIN_DOMAIN}.crt;
+        ssl_certificate_key /etc/ssl/certs/${MAIN_DOMAIN}.key;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+        ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        # 🛑 1. ПРОВЕРКА IP: Допускаются ТОЛЬКО Google и твой IP
+        set $access_allowed 0;
+        if ($is_google = 1) { set $access_allowed 1; }
+        if ($is_my_ip = 1) { set $access_allowed 1; }
+
+        if ($access_allowed = 0) {
+            return 444;
+        }
+
+        # Базовые проверки на ботов и мусор
+        if ($is_allowed_method = 0) { return 444; }
+        if ($is_bad_ua) { return 444; }
+        if ($is_long_uri) { return 444; }
+
+        # 🟢 2. ЭНДПОИНТЫ GOOGLE ASSISTANT И АВТОРИЗАЦИИ (Доступны и для Google, и для тебя)
+        location ~* ^/(auth/authorize|auth/token|api/google_assistant|static/|frontend_latest/|manifest\.json|auth/providers) {
+            proxy_pass http://${HA_BACKEND}:28443;
+            proxy_http_version 1.1;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+
+            proxy_buffering off;
+            proxy_read_timeout 86400;
+            proxy_send_timeout 86400;
+        }
+
+        # 🟢 3. ПОЛНЫЙ ИНТЕРФЕЙС HA (Доступен ТОЛЬКО с твоего IP, Google отсюда отбрасывается)
+        location / {
+            if ($is_my_ip = 0) {
+                return 444;
+            }
+
+            proxy_pass http://${HA_BACKEND}:28443;
+            proxy_http_version 1.1;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+
+            # Полная поддержка WebSocket для работы интерфейса Home Assistant
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+
+            proxy_buffering off;
+            proxy_read_timeout 86400;
+            proxy_send_timeout 86400;
         }
     }
 
     # HTTP → HTTPS редирект
     server {
         listen 80;
-        server_name ${MAIN_DOMAIN} ${PUSH_DOMAIN} ${MAIL_DOMAIN};
+        server_name ${MAIN_DOMAIN} ${PUSH_DOMAIN} ${MAIL_DOMAIN} ${HA_DOMAIN};
         
         access_log /var/log/nginx/access_http.log main;
 
